@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 from telegram import Update, InlineKeyboardButton as B, InlineKeyboardMarkup as M
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ConversationHandler,
-    MessageHandler, ContextTypes, filters,
+    MessageHandler, ContextTypes, ChatMemberHandler, filters,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -38,6 +38,7 @@ ADMINS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip(
 DB_PATH = os.environ.get("DB_PATH", "requests.db")
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Asia/Manila"))
 REMIND_HOURS = float(os.environ.get("REMIND_HOURS", "24"))
+TOPIC_NAME = os.environ.get("TOPIC_NAME", "CUSTOMS").strip().lower()
 
 TYPES = ["Sexting set", "Custom (fan-specific)", "PPV / mass message", "Pics",
          "Video", "Voice note", "Other"]
@@ -68,9 +69,14 @@ def init_db():
             chatter_id INTEGER, model_id INTEGER, type TEXT, details TEXT,
             due_at TEXT, status TEXT DEFAULT 'sent', note TEXT, group_msg_id INTEGER,
             created_at TEXT, done_at TEXT, reminded_at TEXT, reminders INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS groups(chat_id INTEGER PRIMARY KEY, title TEXT);
         CREATE TABLE IF NOT EXISTS cards(chat_id INTEGER, msg_id INTEGER, req_id INTEGER,
             PRIMARY KEY(chat_id, msg_id));
         """)
+        for table in ("models", "groups"):  # add topic column to databases created before topics existed
+            cols = [r["name"] for r in c.execute(f"PRAGMA table_info({table})")]
+            if "thread_id" not in cols:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN thread_id INTEGER")
 
 
 def now():
@@ -151,12 +157,21 @@ async def safe_send(ctx, chat_id, text, **kw):
         return None
 
 
+def topic_kw(thread_id):
+    return {"message_thread_id": thread_id} if thread_id else {}
+
+
+def thread_of(msg):
+    """Topic id a message was sent in (None for normal groups / the General topic)."""
+    return msg.message_thread_id if msg and msg.is_topic_message else None
+
+
 async def post_to_gc(ctx, r, header):
-    """Post a request card into the model's GC and remember the message id (for replies)."""
+    """Post a request card into the model's GC topic and remember the message id (for replies)."""
     m = model(r["model_id"])
     msg = await safe_send(ctx, m["chat_id"], req_text(r, header) +
                           "\n\n<i>Reply to this message with files or a note to send them to the chatter.</i>",
-                          reply_markup=buttons(r))
+                          reply_markup=buttons(r), **topic_kw(m["thread_id"]))
     if msg:
         with db() as c:
             c.execute("UPDATE requests SET group_msg_id=? WHERE id=?", (msg.message_id, r["id"]))
@@ -167,6 +182,8 @@ async def post_to_gc(ctx, r, header):
 # ---------------------------------------------------------------- start / admin
 HELP_ADMIN = ("<b>Admin</b>\n"
               "/linkmodel Name – run this INSIDE a model's group chat to connect it\n"
+              "/groups – groups I'm in, with link buttons\n"
+              "/settopic – run inside a topic to post requests there\n"
               "/unlinkmodel – run inside the group to disconnect it\n"
               "/addchatter – one-time invite link for a chatter\n"
               "/team – list models & chatters\n/removechatter Name\n"
@@ -180,7 +197,15 @@ HELP_GROUP = ("<b>In this group</b>\n/todo – open requests for this model\n"
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat, user = update.effective_chat, update.effective_user
     if chat.type != "private":
-        await update.message.reply_text(HELP_GROUP, parse_mode="HTML")
+        if model_by_chat(chat.id):
+            await update.message.reply_text(HELP_GROUP, parse_mode="HTML")
+        else:
+            if chat.is_forum and not thread_of(update.message):
+                await update.message.reply_text(f"Send /start inside the {TOPIC_NAME.upper()} topic so I post there.")
+                return
+            await offer_link(ctx, chat, thread_of(update.message))
+            await update.message.reply_text("This group isn't linked to a model yet. "
+                                            "I've sent the admins a button in DMs to link it.")
         return
     if ctx.args:
         token = ctx.args[0]
@@ -200,9 +225,16 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"You're not registered yet. Ask your manager for an invite link.\nYour Telegram ID: {user.id}")
 
 
+def is_admin(update: Update):
+    if update.effective_user and update.effective_user.id in ADMINS:
+        return True
+    sc = update.effective_message.sender_chat if update.effective_message else None
+    return bool(sc and sc.id == update.effective_chat.id)  # anonymous admin of this group
+
+
 def admin_only(fn):
     async def wrap(update: Update, ctx):
-        if update.effective_user.id not in ADMINS:
+        if not is_admin(update):
             await update.message.reply_text("Admins only.")
             return
         return await fn(update, ctx)
@@ -215,13 +247,117 @@ async def linkmodel(update, ctx):
     if chat.type == "private":
         await update.message.reply_text("Run /linkmodel Name inside the model's group chat (add me to the group first).")
         return
+    thread = thread_of(update.message)
+    if chat.is_forum and not thread:
+        await update.message.reply_text(f"Send this inside the {TOPIC_NAME.upper()} topic, so requests go there.")
+        return
     name = " ".join(ctx.args).strip() or chat.title
     with db() as c:
         c.execute("DELETE FROM models WHERE chat_id=? OR name=?", (chat.id, name))
-        c.execute("INSERT INTO models(name, chat_id) VALUES(?,?)", (name, chat.id))
+        c.execute("INSERT INTO models(name, chat_id, thread_id) VALUES(?,?,?)", (name, chat.id, thread))
+        c.execute("INSERT OR REPLACE INTO groups(chat_id, title, thread_id) VALUES(?,?,?)", (chat.id, chat.title, thread))
     await update.message.reply_text(
         f"✅ This group is now <b>{html.escape(name)}</b>'s request channel. "
         "Chatters' requests for her will show up here.", parse_mode="HTML")
+
+
+async def offer_link(ctx, chat, thread=None):
+    """Remember a group and DM the admins a button to link it to a model."""
+    with db() as c:
+        old = c.execute("SELECT thread_id FROM groups WHERE chat_id=?", (chat.id,)).fetchone()
+        thread = thread or (old["thread_id"] if old else None)
+        c.execute("INSERT OR REPLACE INTO groups(chat_id, title, thread_id) VALUES(?,?,?)",
+                  (chat.id, chat.title, thread))
+    kb = M([[B("🔗 Link this group to a model", callback_data=f"lg:{chat.id}")]])
+    for a in ADMINS:
+        await safe_send(ctx, a, f"I'm in the group <b>{html.escape(chat.title or str(chat.id))}</b>. "
+                                "Which model is it for?", reply_markup=kb)
+
+
+async def bot_added(update: Update, ctx):
+    m = update.my_chat_member
+    if m.chat.type in ("group", "supergroup") and m.new_chat_member.status in ("member", "administrator") \
+            and m.old_chat_member.status in ("left", "kicked"):
+        await offer_link(ctx, m.chat)
+
+
+async def link_button(update: Update, ctx):
+    q = update.callback_query
+    if q.from_user.id not in ADMINS:
+        await q.answer("Admins only.", show_alert=True)
+        return
+    await q.answer()
+    ctx.user_data["linking"] = int(q.data[3:])
+    await q.message.reply_text("Type the model's name for this group (e.g. Bella):")
+
+
+async def link_name(update: Update, ctx):
+    chat_id = ctx.user_data.pop("linking", None)
+    if not chat_id or update.effective_user.id not in ADMINS:
+        return
+    name = update.message.text.strip()
+    g = q1("SELECT thread_id FROM groups WHERE chat_id=?", chat_id)
+    thread = g["thread_id"] if g else None
+    with db() as c:
+        c.execute("DELETE FROM models WHERE chat_id=? OR name=?", (chat_id, name))
+        c.execute("INSERT INTO models(name, chat_id, thread_id) VALUES(?,?,?)", (name, chat_id, thread))
+    where = f"the {TOPIC_NAME.upper()} topic of that group" if thread else "that group"
+    await update.message.reply_text(f"✅ Linked. Requests for {name} will now go to {where}.")
+    await safe_send(ctx, chat_id, f"✅ This is now <b>{html.escape(name)}</b>'s request channel. "
+                                  "Chatters' requests for her will show up here.", **topic_kw(thread))
+
+
+@admin_only
+async def groups_cmd(update, ctx):
+    rows = qall("SELECT g.chat_id, g.title, m.name FROM groups g LEFT JOIN models m ON m.chat_id=g.chat_id")
+    if not rows:
+        await update.message.reply_text("I don't know any groups yet. Add me to a group, then send /start there.")
+        return
+    for r in rows:
+        kb = M([[B("🔗 Link / relink", callback_data=f"lg:{r['chat_id']}")]])
+        await update.message.reply_text(f"{r['title']} → {r['name'] or 'not linked'}", reply_markup=kb)
+
+
+async def migrated(update: Update, ctx):
+    """Group upgraded to supergroup: its chat id changes, so move everything over."""
+    msg = update.message
+    old, new = (msg.chat.id, msg.migrate_to_chat_id) if msg.migrate_to_chat_id else (msg.migrate_from_chat_id, msg.chat.id)
+    if not old or not new:
+        return
+    with db() as c:
+        c.execute("UPDATE models SET chat_id=? WHERE chat_id=?", (new, old))
+        c.execute("UPDATE OR REPLACE groups SET chat_id=? WHERE chat_id=?", (new, old))
+        c.execute("UPDATE cards SET chat_id=? WHERE chat_id=?", (new, old))
+
+
+async def topic_event(update: Update, ctx):
+    """If a topic named CUSTOMS is created (or renamed to CUSTOMS), send everything there."""
+    msg = update.message
+    ev = msg.forum_topic_created or msg.forum_topic_edited
+    if not ev or not ev.name or ev.name.strip().lower() != TOPIC_NAME:
+        return
+    with db() as c:
+        c.execute("UPDATE models SET thread_id=? WHERE chat_id=?", (msg.message_thread_id, msg.chat.id))
+        c.execute("UPDATE groups SET thread_id=? WHERE chat_id=?", (msg.message_thread_id, msg.chat.id))
+    if model_by_chat(msg.chat.id):
+        await msg.reply_text("✅ Got it – requests for this group will be posted in this topic.")
+
+
+@admin_only
+async def settopic(update, ctx):
+    """Run inside any topic to make it the one requests go to."""
+    thread = thread_of(update.message)
+    if not thread:
+        await update.message.reply_text("Run /settopic inside the topic you want requests posted in.")
+        return
+    with db() as c:
+        c.execute("UPDATE models SET thread_id=? WHERE chat_id=?", (thread, update.effective_chat.id))
+        c.execute("UPDATE groups SET thread_id=? WHERE chat_id=?", (thread, update.effective_chat.id))
+    await update.message.reply_text("✅ Requests for this group will be posted in this topic from now on.")
+
+
+async def on_error(update, ctx):
+    log.exception("Error while handling update", exc_info=ctx.error)
 
 
 @admin_only
@@ -479,12 +615,21 @@ def main():
                     ("addchatter", addchatter), ("team", team), ("removechatter", removechatter),
                     ("all", all_open), ("mine", mine), ("todo", todo)]:
         app.add_handler(CommandHandler(cmd, fn))
+    app.add_handler(CommandHandler("groups", groups_cmd))
+    app.add_handler(CommandHandler("settopic", settopic))
+    app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED | filters.StatusUpdate.FORUM_TOPIC_EDITED,
+                                   topic_event))
+    app.add_handler(ChatMemberHandler(bot_added, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(CallbackQueryHandler(link_button, pattern=r"^lg:-?\d+$"))
+    app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, migrated))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, link_name), group=2)
+    app.add_error_handler(on_error)
     app.add_handler(CallbackQueryHandler(gc_action, pattern=r"^(acc|dec|done):\d+$"))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.REPLY & ~filters.COMMAND, gc_reply), group=1)
 
     app.job_queue.run_repeating(reminders, interval=900, first=30)  # checks every 15 min
     log.info("Bot running…")
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
