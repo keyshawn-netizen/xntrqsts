@@ -32,6 +32,7 @@ from telegram.ext import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("content-bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # keeps the bot token out of the logs
 
 TOKEN = os.environ["BOT_TOKEN"]
 ADMINS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
@@ -132,7 +133,7 @@ STATUS = {"sent": "🟡 Waiting for model", "accepted": "🔵 In progress",
 def req_text(r, header="Request"):
     e = html.escape
     m = model(r["model_id"])
-    return (f"<b>{header} #{r['id']}</b>\n"
+    return (f"<b>{header}</b>\n"
             f"Model: {e(m['name'] if m else '?')}\n"
             f"From chatter: {e(chatter_name(r['chatter_id']))}\n"
             f"Type: <b>{e(r['type'])}</b>\n"
@@ -483,13 +484,13 @@ async def confirm(update: Update, ctx):
             (update.effective_user.id, r["model"], r["type"], r["details"], r["due_at"], ts(now()))).lastrowid
     name = html.escape(model(r["model"])["name"])
     if await post_to_gc(ctx, get_req(rid), "📩 New request"):
-        await q.edit_message_text(f"Sent ✅ Request #{rid} is in {name}'s GC. "
+        await q.edit_message_text(f"Sent ✅ Your {html.escape(r['type'])} request is in {name}'s GC. "
                                   "I'll DM you when it's accepted and done, and I'll keep reminding her until then.")
     else:
-        await q.edit_message_text(f"Request #{rid} saved, but I couldn't post in {name}'s GC "
+        await q.edit_message_text(f"Your request was saved, but I couldn't post in {name}'s GC "
                                   "(was I removed from the group?). Admins have been notified.")
         for a in ADMINS:
-            await safe_send(ctx, a, f"⚠️ Couldn't post request #{rid} to {name}'s group chat.")
+            await safe_send(ctx, a, f"⚠️ Couldn't post a {html.escape(r['type'])} request to {name}'s group chat.")
     return ConversationHandler.END
 
 
@@ -530,9 +531,11 @@ async def gc_action(update: Update, ctx):
     r = get_req(rid)
     await q.edit_message_text(req_text(r) + f"\n\n<i>Updated by {who}</i>", parse_mode="HTML",
                               reply_markup=buttons(r))
-    msgs = {"accepted": f"👍 {html.escape(m['name'])} accepted request #{rid} ({html.escape(r['type'])}).",
-            "declined": f"❌ {html.escape(m['name'])} declined request #{rid}. Check with her or your manager.",
-            "done": f"🎉 {html.escape(m['name'])} finished request #{rid} ({html.escape(r['type'])})!"}
+    what = f"{html.escape(r['type'])} request"
+    snippet = html.escape(r["details"][:60]) + ("…" if len(r["details"]) > 60 else "")
+    msgs = {"accepted": f"👍 {html.escape(m['name'])} accepted your {what}:\n<i>{snippet}</i>",
+            "declined": f"❌ {html.escape(m['name'])} declined your {what}:\n<i>{snippet}</i>\nCheck with her or your manager.",
+            "done": f"🎉 {html.escape(m['name'])} finished your {what}:\n<i>{snippet}</i>"}
     await safe_send(ctx, r["chatter_id"], msgs[r["status"]])
 
 
@@ -547,7 +550,7 @@ async def gc_reply(update: Update, ctx):
     if not r:
         return
     try:
-        await ctx.bot.send_message(r["chatter_id"], f"📎 From {model(r['model_id'])['name']} for request #{r['id']}:")
+        await ctx.bot.send_message(r["chatter_id"], f"📎 From {model(r['model_id'])['name']} for your {r['type']} request:")
         await msg.copy(r["chatter_id"])
         await msg.reply_text("Sent to the chatter ✅ Tap “Mark done” on the request when it's complete.")
     except Exception as ex:
@@ -586,7 +589,7 @@ async def reminders(ctx: ContextTypes.DEFAULT_TYPE):
             head = "⏰ Reminder – this is still not done"
         await post_to_gc(ctx, r, head)
         if overdue and not r["reminders"]:
-            await safe_send(ctx, r["chatter_id"], f"⏰ Request #{r['id']} passed its deadline – I've reminded the model.")
+            await safe_send(ctx, r["chatter_id"], f"⏰ Your {html.escape(r['type'])} request for {html.escape(model(r['model_id'])['name'])} passed its deadline – I've reminded her.")
         with db() as c:
             c.execute("UPDATE requests SET reminded_at=?, reminders=reminders+1 WHERE id=?", (ts(n), r["id"]))
         if r["reminders"] + 1 == 3:  # escalate to admins after 3 nudges
